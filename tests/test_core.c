@@ -468,6 +468,70 @@ static void test_panel(void)
     CHECK_EQ(count_kind(px, w * h, FC_PX_GRAPH), 0);
 }
 
+/* D3D::SynchronizeToPresentationInterval from the Xbox 360 SDK's d3d9.lib (Sep 2013),
+ * 120 instruction words as dumpbin shows them. PresentInterval is at +0x36B0 and the
+ * immediate threshold word at +0x2FFC in this SDK version. */
+static const fc_u32 sdk_sync_words[] = {
+    0x7D8802A6u, 0x4BFFFFFDu, 0x9421FF80u, 0x7C9D2378u, 0x38800001u, 0x7C7F1B78u,
+    0x4BFFFFE9u, 0x38800000u, 0x7FE3FB78u, 0x4BFFFFDDu, 0x3B80FFFFu, 0x2B1D0000u,
+    0x409A008Cu, 0x817F6008u, 0x2B0B0000u, 0x409A0080u, 0x817F0038u, 0x807F0030u,
+    0x7F035840u, 0x4099000Cu, 0x7FE3FB78u, 0x4BFFFFADu, 0x39600579u, 0x39400001u,
+    0x95630004u, 0x3D60C004u, 0x39200013u, 0x616B3C00u, 0x39000001u, 0x38C00100u,
+    0x95430004u, 0x7F87E378u, 0x95630004u, 0x95230004u, 0x817F2B14u, 0x396B0004u,
+    0x556A653Eu, 0x556B00FEu, 0x394A0200u, 0x554A04E6u, 0x7D6A5A14u, 0x616B0002u,
+    0x95630004u, 0x95030004u, 0x97830004u, 0x94C30004u, 0x907F0030u, 0x817F36B0u,
+    0x2B0B0000u, 0x419A0034u, 0x2B0B0001u, 0x419A002Cu, 0x2B0B0002u, 0x419A001Cu,
+    0x396BFFFCu, 0x39400003u, 0x316BFFFFu, 0x7D6B5910u, 0x7D6B5038u, 0x48000010u,
+    0x39600002u, 0x48000008u, 0x39600001u, 0x815F2FFCu, 0x556B402Eu, 0x809F0030u,
+    0x554A4E7Eu, 0x813F0038u, 0x7D4B5B78u, 0x7F044840u, 0x7D7EEB78u, 0x40990010u,
+    0x7FE3FB78u, 0x4BFFFEDDu, 0x7C641B78u, 0x3D600000u, 0x7FC7F378u, 0x38CB0000u,
+    0x38A00000u, 0x7FE3FB78u, 0x4BFFFEC1u, 0x2B1D0000u, 0x907F0030u, 0x409A0074u,
+    0x817F6008u, 0x2B0B0000u, 0x409A0068u, 0x817F0038u, 0x7F035840u, 0x4099000Cu,
+    0x7FE3FB78u, 0x4BFFFE95u, 0x3D60C004u, 0x39400013u, 0x616B3C00u, 0x39200000u,
+    0x95630004u, 0x39000100u, 0x95430004u, 0x817F2B14u, 0x396B0004u, 0x556A653Eu,
+    0x556B00FEu, 0x394A0200u, 0x554A04E6u, 0x7D6A5A14u, 0x616B0002u, 0x95630004u,
+    0x95230004u, 0x97830004u, 0x95030004u, 0x907F0030u, 0x38800000u, 0x7FE3FB78u,
+    0x4BFFFE39u, 0x897F2B3Du, 0x616B0010u, 0x997F2B3Du, 0x38210080u, 0x4BFFFE24u,
+};
+
+static void test_vsync_probe(void)
+{
+    const int n = (int)(sizeof(sdk_sync_words) / sizeof(sdk_sync_words[0]));
+    fc_u32 io = 0, to = 0, a3 = 0, a4 = 0;
+    int i, hits = 0, at = -1;
+
+    printf("vsync probe\n");
+    CHECK_EQ(n, 120);
+    for (i = 0; i < n; i++)
+        if (fc_match_present_fields(sdk_sync_words + i, n - i, &io, &to)) { hits++; at = i; }
+    CHECK_EQ(hits, 1);
+    CHECK_EQ(at, 0xBC / 4);           /* lwz r11,0x36B0(r31) */
+    CHECK_EQ(io, 0x36B0);
+    CHECK_EQ(to, 0x2FFC);
+
+    /* Nothing matches in unrelated code (the counter's own test data). */
+    CHECK(!fc_match_present_fields(sdk_sync_words, 5, &io, &to));
+
+    {
+        /* lis r11,0x8018 ; stw r3,0x1234(r11) ; stw r4,0x1238(r11) ; blr */
+        static const fc_u32 simple[] = { 0x3D608018u, 0x906B1234u, 0x908B1238u, 0x4E800020u };
+        /* mflr r12 ; mr r31,r4 ; lis r10,0x8019 ; addi r10,r10,-0x10 ; stw r31,8(r10) ;
+         * stw r3,4(r10) ; blr */
+        static const fc_u32 moved[] = { 0x7D8802A6u, 0x7C9F2378u, 0x3D408019u, 0x394AFFF0u,
+                                        0x93EA0008u, 0x906A0004u, 0x4E800020u };
+        /* lis r11,0x8018 ; bl x ; stw r3,0(r11): stores after a call are ignored */
+        static const fc_u32 call[] = { 0x3D608018u, 0x48000005u, 0x906B0000u };
+        CHECK_EQ(fc_find_arg_stores(simple, 4, &a3, &a4), 3);
+        CHECK_EQ(a3, 0x80181234u);
+        CHECK_EQ(a4, 0x80181238u);
+        a3 = a4 = 0;
+        CHECK_EQ(fc_find_arg_stores(moved, 7, &a3, &a4), 3);
+        CHECK_EQ(a4, 0x8018FFF8u);
+        CHECK_EQ(a3, 0x8018FFF4u);
+        CHECK_EQ(fc_find_arg_stores(call, 3, &a3, &a4), 0);
+    }
+}
+
 int main(void)
 {
     test_counter();
@@ -479,6 +543,7 @@ int main(void)
     test_stats();
     test_temps();
     test_panel();
+    test_vsync_probe();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }
