@@ -98,6 +98,7 @@ enum {
     D_GOOD_LAST = D_GOOD0 + 15,
     D_SHIFTED,    // frames drawn where the fence was not at rb[0]
     D_SHIFT_K,    // where it was, last time
+    D_ALLOC_FAIL, // times the game could not spare memory for a mode
     D_COUNT
 };
 static const char *kDiagNames[D_COUNT] = {
@@ -113,7 +114,7 @@ static const char *kDiagNames[D_COUNT] = {
     "good_a",
     "good0", "good1", "good2", "good3", "good4", "good5", "good6", "good7",
     "good8", "good9", "good10", "good11", "good12", "good13", "good14", "good15",
-    "shifted", "shift_k"
+    "shifted", "shift_k", "alloc_fail"
 };
 static volatile DWORD g_diag[D_COUNT] = { 0xD1A60200 };
 
@@ -621,54 +622,90 @@ static void LoadConfig()
     if (n > 0) g_diag[D_INI_KEYS] = (DWORD)fc_config_parse(&g_cfg, ini);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Command memory. Nothing is reserved until the counter is first shown, and then only what the
+// current mode needs; it grows when a bigger mode is chosen. (Reserving 1.8 MB at game start
+// made CoD: Advanced Warfare restart.) To switch to a bigger block: stop the hook drawing,
+// wait for in-flight frames and the GPU to finish with the old lists, switch, and free the old
+// block a second later.
+// ---------------------------------------------------------------------------------------------
+
+static DWORD     g_oldVa = 0;          // retired block waiting to be freed
+static ULONGLONG g_oldFreeAt = 0;
+
+static DWORD SlotBytesFor(const FcConfig &mc)
+{
+    int pw, ph;
+    fc_panel_size(&mc, &pw, &ph);
+    return ((DWORD)(pw * ph) * 12 + 127) & ~127u;   // worst case: 3 dwords per pixel
+}
+
+// Returns false if the game cannot spare the memory for this mode.
+static bool EnsureMemory(const FcConfig &mc)
+{
+    if (!g_canvas[0]) {
+        g_canvas[0] = (unsigned char *)malloc((size_t)(g_maxW * g_maxH));
+        g_canvas[1] = (unsigned char *)malloc((size_t)(g_maxW * g_maxH));
+        if (!g_canvas[0] || !g_canvas[1]) {
+            free(g_canvas[0]); free(g_canvas[1]);
+            g_canvas[0] = g_canvas[1] = 0;
+            g_diag[D_ALLOC_FAIL] = g_diag[D_ALLOC_FAIL] + 1;
+            return false;
+        }
+    }
+    DWORD need = SlotBytesFor(mc);
+    if (g_cmdVa && g_slotBytes >= need) return true;
+
+    PVOID cb = XPhysicalAlloc(SLOT_COUNT * need, (ULONG_PTR)(~(ULONG_PTR)0), 0, PAGE_READWRITE);
+    if (!cb || !PhysOf((DWORD)cb)) {
+        if (cb) XPhysicalFree(cb);
+        g_diag[D_ALLOC_FAIL] = g_diag[D_ALLOC_FAIL] + 1;
+        return false;
+    }
+    if (g_cmdVa) {
+        g_ver = 0;                                   // hook stops using the old lists
+        for (DWORD s = 0; s < SLOT_COUNT; s++) g_slotFb[s] = 0;
+        __sync();
+        DelayMs(100);                                // in-flight frames and GPU finish with them
+        if (g_oldVa) XPhysicalFree((PVOID)g_oldVa);  // an earlier retired block: long unused
+        g_oldVa = g_cmdVa;
+        g_oldFreeAt = __mftb() + TB_PER_SEC;
+    }
+    g_slotBytes = need;
+    g_cmdPhys   = PhysOf((DWORD)cb);
+    g_cmdVa     = (DWORD)cb;
+    g_diag[D_CMDVA]    = g_cmdVa;
+    g_diag[D_CMDBYTES] = SLOT_COUNT * need;
+    g_diag[D_STATE]    = 2;
+    return true;
+}
+
 static DWORD WINAPI Worker(LPVOID)
 {
     g_diag[D_STATE] = 1;
     LoadConfig();
 
-    // Buffers are sized for the largest mode in the cycle (the last one). If the game cannot
-    // spare that much memory, fall back to FPS only (modes: off, FPS).
+    // Largest panel in the cycle (the last mode): the canvas size, allocated on first use
     g_modes = fc_mode_count(&g_cfg);
-    for (int attempt = 0; attempt < 2 && g_diag[D_STATE] != 2; attempt++) {
-        if (attempt == 1) g_modes = 2;
+    {
         FcConfig big;
         fc_mode_config(&g_cfg, g_modes - 1, &big);
         fc_panel_size(&big, &g_maxW, &g_maxH);
-        g_slotBytes = ((DWORD)(g_maxW * g_maxH) * 12 + 127) & ~127u;   // 3 dwords per pixel
-        free(g_canvas[0]); free(g_canvas[1]);
-        g_canvas[0] = (unsigned char *)malloc((size_t)(g_maxW * g_maxH));
-        g_canvas[1] = (unsigned char *)malloc((size_t)(g_maxW * g_maxH));
-        PVOID cb = XPhysicalAlloc(SLOT_COUNT * g_slotBytes, (ULONG_PTR)(~(ULONG_PTR)0), 0, PAGE_READWRITE);
-        if (cb && PhysOf((DWORD)cb) && g_canvas[0] && g_canvas[1]) {
-            g_cmdVa   = (DWORD)cb;
-            g_cmdPhys = PhysOf((DWORD)cb);
-            g_diag[D_CMDVA]    = g_cmdVa;
-            g_diag[D_CMDBYTES] = SLOT_COUNT * g_slotBytes;
-            g_diag[D_STATE]    = 2;
-        } else if (cb) {
-            XPhysicalFree(cb);
-        }
     }
     g_diag[D_MODES]   = (DWORD)g_modes;
     g_diag[D_PANEL_W] = (DWORD)g_maxW;
     g_diag[D_PANEL_H] = (DWORD)g_maxH;
     WriteDiagFile();
 
-    // The combo steps through the modes: off, FPS, then each extra added in turn
+    // The combo steps through the modes: off, FPS, then each extra added in turn. Until the
+    // counter is first shown (and at least START_DELAY_MS after game start) nothing is hooked
+    // and nothing is reserved.
     int mode = g_cfg.enabled ? 1 : 0;
-    fc_mode_config(&g_cfg, mode, &g_modeCfg);
+    fc_mode_config(&g_cfg, 0, &g_modeCfg);
     FcToggle tog;
     fc_toggle_init(&tog, g_cfg.combo, (unsigned)g_cfg.hold_ms, TB_PER_SEC, 0);
-    g_overlayOn = mode != 0;
+    g_overlayOn = 0;
     g_diag[D_MODE] = (DWORD)mode;
-
-    for (DWORD w = 0; w < START_DELAY_MS && !g_stop; w += INPUT_POLL_MS)
-        DelayMs(INPUT_POLL_MS);
-    if (g_stop) return 0;
-    if (g_diag[D_STATE] != 2) { WriteDiagFile(); return 0; }    // no memory: nothing to draw
-    InstallHook();
-    WriteDiagFile();
-    if (g_diag[D_PATCH] != 3) return 0;
 
     FcStats stats;
     fc_stats_init(&stats);
@@ -676,23 +713,53 @@ static DWORD WINAPI Worker(LPVOID)
     memset(&pd, 0, sizeof(pd));
     static unsigned short ft[FT_RING];
 
-    ULONGLONG t0 = __mftb(), tLog = t0, tTemp = 0;
-    DWORD f0 = g_diag[D_FRAMES];
+    ULONGLONG tStart = __mftb(), t0 = tStart, tLog = tStart, tTemp = 0;
+    DWORD f0 = 0;
     DWORD fps = 0, shownFps = 0xFFFFFFFF;
-    bool modeChanged = true;
+    bool modeChanged = true, hooked = false;
 
     while (!g_stop) {
         DelayMs(INPUT_POLL_MS);
         ULONGLONG t = __mftb();
 
+        if (g_oldVa && t >= g_oldFreeAt) {       // retired command memory, now unused
+            XPhysicalFree((PVOID)g_oldVa);
+            g_oldVa = 0;
+        }
+
         if (fc_toggle_update(&tog, PadButtons(), t)) {      // combo held: next mode
             mode = (mode + 1) % g_modes;
-            fc_mode_config(&g_cfg, mode, &g_modeCfg);
-            g_overlayOn = mode != 0;
             g_diag[D_MODE] = (DWORD)mode;
             g_diag[D_TOGGLES] = g_diag[D_TOGGLES] + 1;
             modeChanged = true;
             tTemp = 0;                           // fresh temperatures when they appear
+        }
+
+        // Activate: first use hooks VdSwap; every mode change makes sure there is memory for it
+        if (modeChanged && mode != 0 && t - tStart >= (ULONGLONG)START_DELAY_MS * TB_PER_MS) {
+            if (!hooked) {
+                InstallHook();
+                WriteDiagFile();
+                if (g_diag[D_PATCH] != 3) {      // wrong kernel or cannot patch: stay off for good
+                    g_modes = 1;
+                    mode = 0;
+                }
+                hooked = g_diag[D_PATCH] == 3;
+                t0 = t;
+                f0 = g_diag[D_FRAMES];
+            }
+            if (hooked) {
+                FcConfig mc;
+                fc_mode_config(&g_cfg, mode, &mc);
+                if (!EnsureMemory(mc)) mode = 0; // the game cannot spare it: back to off
+                g_diag[D_MODE] = (DWORD)mode;
+            }
+        }
+        if (hooked) fc_mode_config(&g_cfg, mode, &g_modeCfg);
+        g_overlayOn = hooked && mode != 0 && g_cmdVa;
+        if (!hooked) {
+            if (t - tLog >= (ULONGLONG)LOG_EVERY_MS * TB_PER_MS) { WriteDiagFile(); tLog = t; }
+            continue;                            // nothing to measure or draw yet
         }
 
         if (g_fbDirty) {                         // new front buffer or frame size: lists for it
@@ -738,7 +805,8 @@ static DWORD WINAPI Worker(LPVOID)
                 pd.ft_x10 = ft;
                 pd.ft_count = (int)cnt;
             }
-            DWORD nv = g_ver + 1;
+            static DWORD seq = 0;                // version numbers keep counting even if
+            DWORD nv = ++seq;                    // g_ver was reset during a memory switch
             int pw, ph;
             fc_panel_size(&g_modeCfg, &pw, &ph);
             g_cvW[nv & 1] = pw;
