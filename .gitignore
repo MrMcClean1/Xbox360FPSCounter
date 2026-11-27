@@ -1,0 +1,17 @@
+# Whitelist: only source, scripts and docs are tracked. Everything else in this folder
+# (console copies, Aurora data, build output, third-party tools, session notes) stays local.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
+!/build.bat
+!/test.bat
+!/make-ini.ps1
+!/fps.ini
+!/Makefile
+!/core/
+!/tests/
+!/tools/
+!/overlay/
+!/hello/
