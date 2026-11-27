@@ -71,7 +71,15 @@ To turn it off for one game, rename that game's ini to `.off`.
 - Toasts (XNotifyQueueUI) from the DLL never appear. Logs go to `Hdd1:\fps_diag.txt`.
 - The kernel's fence-and-NOP block in the GPU ring is not always at the start of the block
   `VdSwap` hands over (seen 10 dwords in, in Saints Row). The hook searches for it; drawing
-  only when it is at offset 0 skipped about 1 frame in 25, which showed as flicker.
+  only when it is at offset 0 skipped about 1 frame in 25.
+
+## Known issues
+
+- In games without V-Sync (Saints Row, for example) the panel flickers a little when the screen
+  tears. The GPU writes land in each frame as it is handed to the display, so when the game
+  swaps buffers mid-screen, part of the picture can briefly show without the panel. Moving the
+  panel did not change it. XenonFPS reports the same.
+- Text colors other than white are untested; red and blue may come out swapped.
 
 ## License
 
