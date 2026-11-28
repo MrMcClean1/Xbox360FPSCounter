@@ -117,6 +117,12 @@ enum {
     D_V_TWORD,    // raw threshold word now
     D_V_THRESH,   // PresentImmediateThreshold now (0-100: % of scanout)
     D_V_SCANMS,   // scan time in ms
+    // Pixel readback (is the panel still in the front buffer after we draw it?)
+    D_PX_OFF,     // byte offset in the front buffer of one sampled text pixel
+    D_PX_WANT,    // the value we write there
+    D_PX_LAST,    // last value read there
+    D_PX_OK,      // samples (every 50 ms) where it still held our value
+    D_PX_BAD,     // samples where something else was there
     D_COUNT
 };
 static const char *kDiagNames[D_COUNT] = {
@@ -136,7 +142,8 @@ static const char *kDiagNames[D_COUNT] = {
     "v_fn", "v_k0", "v_k1", "v_k2", "v_k3", "v_k4", "v_k5", "v_k6", "v_k7", "v_k8", "v_k9",
     "v_k10", "v_k11", "v_found", "v_cbaddr", "v_ctxaddr", "v_cb", "v_ctx", "v_base", "v_size",
     "v_matches", "v_agree", "v_match_at", "v_ioff", "v_toff", "v_interval", "v_tword",
-    "v_thresh", "v_scanms"
+    "v_thresh", "v_scanms",
+    "px_off", "px_want", "px_last", "px_ok", "px_bad"
 };
 static volatile DWORD g_diag[D_COUNT] = { 0xD1A60200 };
 
@@ -373,6 +380,10 @@ static void BuildSlot(DWORD e, DWORD ver, const Geo &g)
             int kind = cv[y * pw + x];
             DWORD sx = ox + (DWORD)x;
             if (kind == FC_PX_SKIP || sx >= g.wid || n + 3 > maxDw) continue;
+            if (x == 0 && y == 0 && kind == FC_PX_BG) {    // the panel's top-left pixel: always
+                g_diag[D_PX_OFF]  = TiledOff(sx, sy, g.tpr); // backing box, whatever the digits
+                g_diag[D_PX_WANT] = col[kind & 7];
+            }
             cb[n++] = 0xC0013D00;                                   // MEM_WRITE, one dword
             cb[n++] = PhysOf(fb + TiledOff(sx, sy, g.tpr)) | 2;     // physical | endian 8in32
             cb[n++] = col[kind & 7];
@@ -917,6 +928,16 @@ static DWORD WINAPI Worker(LPVOID)
                 tLog = t;
             }
             continue;                            // nothing to measure or draw yet
+        }
+
+        // Pixel readback: is our panel still in the last presented front buffer?
+        if (g_overlayOn && g_diag[D_FB] && g_diag[D_PX_WANT]) {
+            DWORD v;
+            if (SafeRead(g_diag[D_FB] + g_diag[D_PX_OFF], &v)) {
+                g_diag[D_PX_LAST] = v;
+                if (v == g_diag[D_PX_WANT]) g_diag[D_PX_OK] = g_diag[D_PX_OK] + 1;
+                else                        g_diag[D_PX_BAD] = g_diag[D_PX_BAD] + 1;
+            }
         }
 
         if (g_fbDirty) {                         // new front buffer or frame size: lists for it
