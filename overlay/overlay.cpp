@@ -1045,12 +1045,20 @@ extern "C" BOOL WINAPI DllMain(HANDLE, DWORD reason, LPVOID)
     ExRegisterTitleTerminateNotification(&g_termReg, TRUE);
     g_termRegistered = 1;
 
-    // Normal title thread (flags 0), so it ends with the game
+    // Normal title thread (flags 0), so it ends with the game. Not pinned to hardware thread 5
+    // (XenonFPS did): in Far Cry 2 the worker never wrote its first log, and a game keeping
+    // that hardware thread busy would starve it.
     HANDLE h = NULL;
     DWORD tid = 0;
-    if (ExCreateThread(&h, 0, &tid, (PVOID)XapiThreadStartup, (LPTHREAD_START_ROUTINE)Worker, NULL, 0) >= 0 && h != NULL) {
-        XSetThreadProcessor(h, 5);
+    NTSTATUS st = ExCreateThread(&h, 0, &tid, (PVOID)XapiThreadStartup, (LPTHREAD_START_ROUTINE)Worker, NULL, 0);
+    if (st >= 0 && h != NULL)
         CloseHandle(h);
-    }
+
+    // Marker: proves DllMain ran in this game, and whether the worker thread was created
+    char msg[48], *p = msg;
+    p = PutStr(p, "attach: ExCreateThread=0x");
+    p = PutHex(p, (DWORD)st);
+    p = PutStr(p, "\r\n");
+    WriteNtFile("\\Device\\Harddisk0\\Partition1\\fps_attach.txt", msg, (ULONG)(p - msg));
     return TRUE;
 }
