@@ -78,7 +78,8 @@ To turn it off for one game, rename that game's ini to `.off`.
 - In games without V-Sync (Saints Row, for example) the panel flickers a little when the screen
   tears. The GPU writes land in each frame as it is handed to the display, so when the game
   swaps buffers mid-screen, part of the picture can briefly show without the panel. Moving the
-  panel did not change it. XenonFPS reports the same.
+  panel did not change it. XenonFPS reports the same. Research into forcing V-Sync per game
+  lives in its own project, [Xbox360VSync](https://github.com/MrMcClean1/Xbox360VSync).
 - Text colors other than white are untested; red and blue may come out swapped.
 
 ## License

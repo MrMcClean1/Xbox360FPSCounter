@@ -56,8 +56,6 @@ extern "C" {
                                   void *buf, ULONG len, LARGE_INTEGER *offset);
     NTSTATUS __stdcall NtClose(HANDLE h);
     void     __stdcall HalSendSMCMessage(void *input, void *output);
-    NTSTATUS __stdcall XexGetModuleHandle(const char *name, HANDLE *h);
-    NTSTATUS __stdcall XexGetProcedureAddress(HANDLE h, ULONG ordinal, void **addr);
 }
 
 // Title termination notification (layout from community kernel headers; routine takes no args).
@@ -101,22 +99,6 @@ enum {
     D_SHIFTED,    // frames drawn where the fence was not at rb[0]
     D_SHIFT_K,    // where it was, last time
     D_ALLOC_FAIL, // times the game could not spare memory for a mode
-    // V-Sync probe (read-only, once ~20 s in; the two values re-read every 5 s)
-    D_V_FN,       // kernel VdSetGraphicsInterruptCallback address
-    D_V_K0,       // its first 12 instruction words
-    D_V_K11 = D_V_K0 + 11,
-    D_V_FOUND,    // 1 = where it stores the callback found, 2 = where it stores the context found
-    D_V_CBADDR, D_V_CTXADDR,   // those kernel addresses
-    D_V_CB, D_V_CTX,           // the game's interrupt callback and its context (D3D device)
-    D_V_BASE, D_V_SIZE,        // game image scanned
-    D_V_MATCHES,  // SynchronizeToPresentationInterval patterns found
-    D_V_AGREE,    // 1 = all matches gave the same offsets
-    D_V_MATCH_AT, // address of the first match
-    D_V_IOFF, D_V_TOFF,        // PresentInterval offset, threshold word offset (in the device)
-    D_V_INTERVAL, // PresentInterval value now (D3DPRESENT_INTERVAL_*)
-    D_V_TWORD,    // raw threshold word now
-    D_V_THRESH,   // PresentImmediateThreshold now (0-100: % of scanout)
-    D_V_SCANMS,   // scan time in ms
     // Pixel readback (is the panel still in the front buffer after we draw it?)
     D_PX_OFF,     // byte offset in the front buffer of one sampled text pixel
     D_PX_WANT,    // the value we write there
@@ -139,10 +121,6 @@ static const char *kDiagNames[D_COUNT] = {
     "good0", "good1", "good2", "good3", "good4", "good5", "good6", "good7",
     "good8", "good9", "good10", "good11", "good12", "good13", "good14", "good15",
     "shifted", "shift_k", "alloc_fail",
-    "v_fn", "v_k0", "v_k1", "v_k2", "v_k3", "v_k4", "v_k5", "v_k6", "v_k7", "v_k8", "v_k9",
-    "v_k10", "v_k11", "v_found", "v_cbaddr", "v_ctxaddr", "v_cb", "v_ctx", "v_base", "v_size",
-    "v_matches", "v_agree", "v_match_at", "v_ioff", "v_toff", "v_interval", "v_tword",
-    "v_thresh", "v_scanms",
     "px_off", "px_want", "px_last", "px_ok", "px_bad"
 };
 static volatile DWORD g_diag[D_COUNT] = { 0xD1A60200 };
@@ -713,13 +691,6 @@ static bool EnsureMemory(const FcConfig &mc)
     return true;
 }
 
-// ---------------------------------------------------------------------------------------------
-// V-Sync probe (research, read-only). Each game's own D3D decides when a frame is shown: its
-// device holds PresentInterval and PresentImmediateThreshold (adaptive V-Sync, the likely
-// cause of tearing). Find the device and the two fields, and log their values. Nothing is
-// written. See HANDOFF.md, "VSync research".
-// ---------------------------------------------------------------------------------------------
-
 static bool SafeRead(DWORD addr, DWORD *out)
 {
     if ((addr & 3) || addr < 0x10000) return false;
@@ -728,113 +699,6 @@ static bool SafeRead(DWORD addr, DWORD *out)
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
-    }
-}
-
-static DWORD Swap32(DWORD v)
-{
-    return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24);
-}
-
-// Finds the loaded image containing addr: steps down 64 KB at a time to an 'MZ' header whose
-// PE signature checks out, and reads SizeOfImage (PE headers may be either byte order).
-static bool ImageOf(DWORD addr, DWORD *base, DWORD *size)
-{
-    for (DWORD b = addr & 0xFFFF0000; b >= 0x80000000 && b > (addr & 0xFFFF0000) - 0x8000000; b -= 0x10000) {
-        DWORD w0, lf, sig, sz;
-        if (!SafeRead(b, &w0) || (w0 >> 16) != 0x4D5A) continue;               // 'MZ'
-        if (!SafeRead(b + 0x3C, &lf)) continue;
-        for (int order = 0; order < 2; order++) {
-            DWORD off = order ? lf : Swap32(lf);
-            if (off == 0 || off > 0x1000 || (off & 3)) continue;
-            if (!SafeRead(b + off, &sig) || sig != 0x50450000) continue;      // "PE\0\0"
-            if (!SafeRead(b + off + 0x50, &sz)) continue;
-            sz = order ? sz : Swap32(sz);
-            if (sz < 0x10000 || sz > 0x4000000) continue;
-            *base = b;
-            *size = sz;
-            return true;
-        }
-    }
-    return false;
-}
-
-static DWORD g_vDev = 0, g_vIoff = 0, g_vToff = 0;   // set when the probe succeeds
-
-static void ReadVsyncValues()
-{
-    DWORD v, w;
-    if (!g_vDev) return;
-    if (SafeRead(g_vDev + g_vIoff, &v)) g_diag[D_V_INTERVAL] = v;
-    if (SafeRead(g_vDev + g_vToff, &w)) {
-        g_diag[D_V_TWORD]  = w;
-        g_diag[D_V_THRESH] = (w >> 23) & 0x7F;
-    }
-}
-
-static void VsyncProbe()
-{
-    // 1. Where the kernel keeps the game's graphics interrupt callback and its context
-    HANDLE k = 0;
-    void *fn = 0;
-    if (XexGetModuleHandle("xboxkrnl.exe", &k) < 0 || XexGetProcedureAddress(k, 469, &fn) < 0 || !fn)
-        return;
-    g_diag[D_V_FN] = (DWORD)fn;
-    fc_u32 code[32];
-    int nw = 0;
-    for (; nw < 32; nw++) if (!SafeRead((DWORD)fn + nw * 4, (DWORD *)&code[nw])) break;
-    for (int q = 0; q < 12 && q < nw; q++) g_diag[D_V_K0 + q] = code[q];
-    fc_u32 cbAddr = 0, ctxAddr = 0;
-    int found = fc_find_arg_stores(code, nw, &cbAddr, &ctxAddr);
-    g_diag[D_V_FOUND] = (DWORD)found;
-    g_diag[D_V_CBADDR] = cbAddr;
-    g_diag[D_V_CTXADDR] = ctxAddr;
-    DWORD cb = 0, ctx = 0;
-    if (found & 1) SafeRead(cbAddr, &cb);
-    if (found & 2) SafeRead(ctxAddr, &ctx);
-    g_diag[D_V_CB] = cb;
-    g_diag[D_V_CTX] = ctx;
-
-    // 2. The game image: the one holding the callback, else the usual title base
-    DWORD base = 0, size = 0;
-    if (!(cb && ImageOf(cb, &base, &size)) && !ImageOf(0x82000000, &base, &size))
-        return;
-    g_diag[D_V_BASE] = base;
-    g_diag[D_V_SIZE] = size;
-
-    // 3. Scan its code for D3D's SynchronizeToPresentationInterval
-    ULONGLONG t0 = __mftb();
-    DWORD matches = 0, agree = 1, io = 0, to = 0, at = 0;
-    for (DWORD chunk = 0; chunk < size; chunk += 0x10000) {
-        __try {
-            const fc_u32 *w = (const fc_u32 *)(base + chunk);
-            DWORD n = (size - chunk) / 4;
-            if (n > 0x4000) n = 0x4000;
-            for (DWORD i = 0; i < n; i++) {
-                if ((w[i] >> 26) != 32) continue;                    // starts with lwz
-                fc_u32 a, b;
-                DWORD avail = (size - chunk) / 4 - i;
-                if (fc_match_present_fields(w + i, (int)(avail > 48 ? 48 : avail), &a, &b)) {
-                    if (matches == 0) { io = a; to = b; at = base + chunk + i * 4; }
-                    else if (a != io || b != to) agree = 0;
-                    matches++;
-                }
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            // unreadable 64 KB: skip it
-        }
-    }
-    g_diag[D_V_SCANMS]   = (DWORD)((__mftb() - t0) / TB_PER_MS);
-    g_diag[D_V_MATCHES]  = matches;
-    g_diag[D_V_AGREE]    = agree;
-    g_diag[D_V_MATCH_AT] = at;
-    g_diag[D_V_IOFF]     = io;
-    g_diag[D_V_TOFF]     = to;
-
-    // 4. Current values, if everything lined up
-    if (ctx && matches && agree) {
-        g_vDev = ctx; g_vIoff = io; g_vToff = to;
-        ReadVsyncValues();
     }
 }
 
@@ -874,7 +738,7 @@ static DWORD WINAPI Worker(LPVOID)
     ULONGLONG tStart = __mftb(), t0 = tStart, tLog = tStart, tTemp = 0;
     DWORD f0 = 0;
     DWORD fps = 0, shownFps = 0xFFFFFFFF;
-    bool modeChanged = true, hooked = false, probed = false;
+    bool modeChanged = true, hooked = false;
 
     while (!g_stop) {
         DelayMs(INPUT_POLL_MS);
@@ -883,12 +747,6 @@ static DWORD WINAPI Worker(LPVOID)
         if (g_oldVa && t >= g_oldFreeAt) {       // retired command memory, now unused
             XPhysicalFree((PVOID)g_oldVa);
             g_oldVa = 0;
-        }
-
-        if (!probed && t - tStart >= (ULONGLONG)START_DELAY_MS * TB_PER_MS) {
-            probed = true;                       // V-Sync research: read-only, once
-            VsyncProbe();
-            WriteDiagFile();
         }
 
         if (fc_toggle_update(&tog, PadButtons(), t)) {      // combo held: next mode
@@ -923,7 +781,6 @@ static DWORD WINAPI Worker(LPVOID)
         g_overlayOn = hooked && mode != 0 && g_cmdVa;
         if (!hooked) {
             if (t - tLog >= (ULONGLONG)LOG_EVERY_MS * TB_PER_MS) {
-                ReadVsyncValues();
                 WriteDiagFile();
                 tLog = t;
             }
@@ -999,7 +856,6 @@ static DWORD WINAPI Worker(LPVOID)
         }
 
         if (t - tLog >= (ULONGLONG)LOG_EVERY_MS * TB_PER_MS) {
-            ReadVsyncValues();
             WriteDiagFile();
             tLog = t;
         }

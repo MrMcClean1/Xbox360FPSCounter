@@ -177,26 +177,6 @@ void fc_panel_render(const FcConfig *cfg, const FcPanelData *d,
 /* SMC 0x07 reply (16 bytes) -> CPU, GPU, RAM, board in whole degrees C. */
 void fc_decode_temps(const unsigned char *reply, int out_c[4]);
 
-/* ------------------------------------------------------------------ */
-/* V-Sync probe: PowerPC pattern matching (read-only research)         */
-/* ------------------------------------------------------------------ */
-
-/* Instruction words are passed as numbers (as the CPU reads them). */
-typedef unsigned int fc_u32;
-
-/* Checks for D3D's SynchronizeToPresentationInterval at w[0]:
- *     lwz  rT, X(rB) ; cmplwi rT,0 ; bc ; cmplwi rT,1 ; bc ; cmplwi rT,2
- * then, within the next words, "lwz rS, Y(rB)" followed by
- * "rlwinm rA, rS, 9, 25, 31" (the 7-bit immediate threshold).
- * On a match returns 1 and sets X (PresentInterval offset in the device)
- * and Y (offset of the word holding PresentImmediateThreshold). */
-int fc_match_present_fields(const fc_u32 *w, int avail, fc_u32 *interval_off, fc_u32 *threshold_off);
-
-/* Follows lis/addi/ori/mr through the first n words of a function and
- * finds where it stores its first two arguments (r3, r4) with stw.
- * Returns a bit mask: 1 = r3 store found, 2 = r4 store found. */
-int fc_find_arg_stores(const fc_u32 *w, int n, fc_u32 *r3_addr, fc_u32 *r4_addr);
-
 #ifdef __cplusplus
 }
 #endif
